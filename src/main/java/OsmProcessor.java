@@ -1,121 +1,141 @@
+
+import generated.Node;
+import lombok.RequiredArgsConstructor;
+import entity.NodeEntity;
+import service.NodeService;
+
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBException;
+import javax.xml.bind.Unmarshaller;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
 import javax.xml.stream.events.XMLEvent;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.stream.Collectors;
 
+@RequiredArgsConstructor
 public class OsmProcessor {
-    private final Map<String, Integer> tagNodesCount = new HashMap<>();
-    private final Map<String, Integer> userNodesCount = new HashMap<>();
+    private final NodeService nodeService;
 
-    public void processOsm() throws IOException, XMLStreamException {
+    public void processOsm() throws IOException, XMLStreamException, JAXBException {
         try (
-            var fileInputStream = Files.newInputStream(Paths.get("RU-NVS.osm"));
-            var handler = new StaxStreamHandler(fileInputStream)
+            InputStream fileInputStream = Files.newInputStream(Paths.get("RU-NVS.osm"));
+            StaxStreamHandler handler = new StaxStreamHandler(fileInputStream)
         ) {
-            accumulateDataFrom(handler);
-
-            printSortedChangesCountPerUser();
-            printMap(tagNodesCount, "#2 Count of TAG [%s] in nodes: %s%n");
+            processDataFrom(handler);
         }
     }
 
-    private void accumulateDataFrom(StaxStreamHandler handler) throws XMLStreamException {
-        var reader = handler.getReader();
-        CurrentUser currentUser = null;
-        var openedNodeSection = false;
+    private void processDataFrom(StaxStreamHandler handler) throws XMLStreamException, JAXBException {
+        XMLStreamReader reader = handler.getReader();
+        JAXBContext jaxbContext = JAXBContext.newInstance(Node.class);
+        Unmarshaller unmarshaller = jaxbContext.createUnmarshaller();
+
+        processNodeSection(reader, unmarshaller);
+    }
+
+    private void processNodeSection(XMLStreamReader reader, Unmarshaller unmarshaller) throws XMLStreamException, JAXBException {
+        saveNodesWithExecuteQuery(reader, unmarshaller, 1_000);
+        saveNodesWithPreparedStatement(reader, unmarshaller, 1_000);
+        saveNodesBuffered(reader, unmarshaller, 1_000);
+    }
+
+    private void saveNodesWithPreparedStatement(XMLStreamReader reader, Unmarshaller unmarshaller, int nodesToProcess) throws XMLStreamException, JAXBException {
+        int count = 0;
+        Long time = 0L;
         while (reader.hasNext()) {
-            var event = reader.next();
+            int event = reader.next();
             if (isNodeSectionStart(reader, event)) {
-                openedNodeSection = true;
-                currentUser = processNodeSection(reader, currentUser);
-            }
-            if (isTagSection(reader, openedNodeSection, event)){
-                processTagSection(reader);
-            }
-            if (isNodeSectionFinish(reader, event)){
-                openedNodeSection = false;
+                Node node = (Node) unmarshaller.unmarshal(reader);
+                NodeEntity entity = NodeEntity.convert(node);
+
+                long cur = System.currentTimeMillis();
+                nodeService.putNodeWithPreparedStatement(entity);
+                cur = System.currentTimeMillis() - cur;
+                count++;
+
+                time += cur;
+
+                if (count % 1000 == 0 && count != 0) {
+                    System.out.println("Strategy: PreparedStatement");
+                    System.out.println("Current input objects: " + count);
+                    System.out.println("Current time in ms for 1 object: " + time.doubleValue() / count);
+                    System.out.println("Current time: " + time);
+                    System.out.println("-----------------------------------");
+                }
+
+                if (count == nodesToProcess)
+                    break;
             }
         }
     }
 
-    private void printSortedChangesCountPerUser() {
-        userNodesCount.entrySet().stream()
-                .sorted(Collections.reverseOrder(Map.Entry.comparingByValue()))
-                .map(it -> "#1 Username: " + it.getKey() + " count of user changes: " + it.getValue())
-                .forEach(System.out::println);
-    }
+    private void saveNodesBuffered(XMLStreamReader reader, Unmarshaller unmarshaller, int nodesToProcess) throws XMLStreamException, JAXBException {
+        int count = 0;
+        Long time = 0L;
+        while (reader.hasNext()) {
+            int event = reader.next();
+            if (isNodeSectionStart(reader, event)) {
+                Node node = (Node) unmarshaller.unmarshal(reader);
 
-    private void printMap(Map<String, Integer> sortedTagsMap, String pattern) {
-        for (Map.Entry<String, Integer> entry : sortedTagsMap.entrySet())
-            System.out.printf(pattern, entry.getKey(), entry.getValue());
-    }
+                NodeEntity entity = NodeEntity.convert(node);
 
-    private void processTagSection(XMLStreamReader reader) {
-        var tagKey = extractKeyFromTagSection(reader);
-        saveChangesToMap(tagNodesCount, tagKey, 1);
-    }
+                long cur = System.currentTimeMillis();
+                nodeService.putNodeBuffered(entity);
+                cur = System.currentTimeMillis() - cur;
+                count++;
 
-    private CurrentUser processNodeSection(XMLStreamReader reader, CurrentUser currentUser) {
-        if (currentUser == null) {
-            currentUser = new CurrentUser(extractUsernameFromNodeSection(reader));
-        } else if (!currentUser.getName().equals(extractUsernameFromNodeSection(reader))) {
-            saveChangesToMap(userNodesCount, currentUser.getName(), currentUser.getNodes());
-            currentUser = new CurrentUser(extractUsernameFromNodeSection(reader));
+                time += cur;
+
+                if (count % 1000 == 0 && count != 0) {
+                    System.out.println("Strategy: Buffered");
+                    System.out.println("Current input objects: " + count);
+                    System.out.println("Current time in ms for 1 object: " + time.doubleValue() / count);
+                    System.out.println("Current time: " + time);
+                    System.out.println("-----------------------------------");
+                }
+
+                if (count == nodesToProcess)
+                    break;
+            }
         }
-        currentUser.increaseNodesByOne();
-        return currentUser;
     }
 
-    private void saveChangesToMap(Map<String, Integer> map, String key, int valueDelta) {
-        map.merge(key, valueDelta, Integer::sum);
-    }
+    private void saveNodesWithExecuteQuery(XMLStreamReader reader, Unmarshaller unmarshaller, int nodesToProcess) throws XMLStreamException, JAXBException {
+        int count = 0;
+        Long time = 0L;
+        while (reader.hasNext()) {
+            int event = reader.next();
+            if (isNodeSectionStart(reader, event)) {
+                Node node = (Node) unmarshaller.unmarshal(reader);
 
-    private String extractUsernameFromNodeSection(XMLStreamReader reader) {
-        return reader.getAttributeValue(4);
-    }
+                NodeEntity entity = NodeEntity.convert(node);
 
-    private String extractKeyFromTagSection(XMLStreamReader reader) {
-        return reader.getAttributeValue(0);
-    }
+                long cur = System.currentTimeMillis();
+                nodeService.putNode(entity);
+                cur = System.currentTimeMillis() - cur;
+                count++;
 
-    private boolean isNodeSectionFinish(XMLStreamReader reader, int event) {
-        return event == XMLEvent.END_ELEMENT && "node".equals(reader.getLocalName());
+                time += cur;
+
+                if (count % 1000 == 0 && count != 0) {
+                    System.out.println("Strategy: ExecuteQuery");
+                    System.out.println("Current input objects: " + count);
+                    System.out.println("Current time in ms for 1 object: " + time.doubleValue() / count);
+                    System.out.println("Current time: " + time);
+                    System.out.println("-----------------------------------");
+                }
+
+                if (count == nodesToProcess)
+                    break;
+            }
+        }
     }
 
     private boolean isNodeSectionStart(XMLStreamReader reader, int event) {
         return event == XMLEvent.START_ELEMENT && "node".equals(reader.getLocalName());
-    }
-
-    private boolean isTagSection(XMLStreamReader reader, boolean opened, int event) {
-        return event == XMLEvent.START_ELEMENT && "tag".equals(reader.getLocalName()) && opened;
-    }
-
-    private static class CurrentUser {
-        private final String name;
-        private int nodes;
-
-        public CurrentUser(String name) {
-            this.name = name;
-            this.nodes = 0;
-        }
-
-        public String getName() {
-            return name;
-        }
-
-        public int getNodes() {
-            return nodes;
-        }
-
-        public void increaseNodesByOne() {
-            nodes++;
-        }
     }
 }
 
